@@ -6,13 +6,12 @@ import type { PostcardReport } from "@/src/lib/postcard";
 
 const EASE: [number, number, number, number] = [0.16, 1, 0.3, 1];
 
-/* ── Stage config ──────────────────────────────────── */
 export type AnalysisStage = 0 | 1 | 2 | 3 | 4;
 
 interface StageInfo {
   label: string;
   detail: string;
-  mailboxX: number; // 0–100 percentage across landscape
+  mailboxX: number;
 }
 
 const STAGES: StageInfo[] = [
@@ -33,9 +32,6 @@ const STAGES: StageInfo[] = [
   },
 ];
 
-const STAGE_DURATIONS = [2800, 3200, 3200]; // ms per stage
-
-/* ── Paper airplane SVG ───────────────────────────── */
 function PaperPlane({ className = "" }: { className?: string }) {
   return (
     <svg
@@ -86,7 +82,6 @@ function PaperPlane({ className = "" }: { className?: string }) {
   );
 }
 
-/* ── Cloud ─────────────────────────────────────────── */
 function Cloud({
   cx,
   cy,
@@ -134,7 +129,6 @@ function Cloud({
   );
 }
 
-/* ── Mailbox ───────────────────────────────────────── */
 function Mailbox({
   active,
   passed,
@@ -147,7 +141,6 @@ function Mailbox({
   const label = STAGES[stageIndex].label;
   return (
     <g className={active ? "mailbox-glowing" : ""}>
-      {/* Post */}
       <rect
         x="18"
         y="44"
@@ -156,7 +149,6 @@ function Mailbox({
         rx="1"
         fill="var(--postal-green-dark)"
       />
-      {/* Box body */}
       <rect
         x="4"
         y="26"
@@ -165,7 +157,6 @@ function Mailbox({
         rx="3"
         fill={passed ? "var(--postal-red)" : "#8b6340"}
       />
-      {/* Slot */}
       <rect
         x="10"
         y="32"
@@ -174,14 +165,12 @@ function Mailbox({
         rx="1.5"
         fill="rgba(0,0,0,0.25)"
       />
-      {/* Flag */}
       {passed && (
         <g style={{ animation: "flag-raise 0.4s ease-out both" }}>
           <rect x="36" y="18" width="2" height="12" fill="#c8a060" />
           <polygon points="38,18 38,26 46,22" fill="var(--postal-red)" />
         </g>
       )}
-      {/* Glow dot */}
       {active && (
         <circle
           cx="20"
@@ -191,7 +180,6 @@ function Mailbox({
           opacity="0.9"
         />
       )}
-      {/* Label (above) */}
       {(active || passed) && (
         <text
           x="20"
@@ -209,14 +197,20 @@ function Mailbox({
   );
 }
 
-/* ── SSE parser ───────────────────────────────────── */
-async function fetchReport(file: File): Promise<PostcardReport> {
-  const formData = new FormData();
-  formData.append("file", file);
+type ApiProgress = {
+  stage: string;
+  message: string;
+  progress: number;
+};
 
-  const response = await fetch("/api/analyses", {
+async function fetchReportWithProgress(
+  postUrl: string,
+  onProgress: (progress: ApiProgress) => void,
+): Promise<PostcardReport> {
+  const response = await fetch("/api/postcards", {
     method: "POST",
-    body: formData,
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ url: postUrl }),
   });
 
   if (!response.ok || !response.body) {
@@ -243,69 +237,63 @@ async function fetchReport(file: File): Promise<PostcardReport> {
       const event = eventMatch[1];
       const payload = JSON.parse(dataMatch[1]);
 
-      if (event === "complete") return payload.report as PostcardReport;
-      if (event === "error") throw new Error(payload.error);
+      if (event === "progress") {
+        onProgress(payload as ApiProgress);
+      } else if (event === "complete") {
+        return payload.forensicReport as PostcardReport;
+      } else if (event === "error") {
+        throw new Error(payload.error);
+      }
     }
   }
 
   throw new Error("Stream ended without a result.");
 }
 
-/* ── Main AnalysisJourney ─────────────────────────── */
-
 export function AnalysisJourney({
-  imageUrl,
-  file,
+  postUrl,
   onComplete,
 }: {
-  imageUrl: string;
-  file: File;
+  postUrl: string;
   onComplete: (report: PostcardReport) => void;
 }) {
   const [stage, setStage] = useState<AnalysisStage>(0);
-  const [animDone, setAnimDone] = useState(false);
+  const [stageLabel, setStageLabel] = useState("Dispatched");
+  const [stageDetail, setStageDetail] = useState("Evidence en route…");
+  const [error, setError] = useState<string | null>(null);
   const pendingReport = useRef<PostcardReport | null>(null);
   const onCompleteRef = useRef(onComplete);
-  onCompleteRef.current = onComplete;
+  const hasCompletedRef = useRef(false);
 
-  /* Animation timer */
   useEffect(() => {
-    let elapsed = 0;
-    const timers: ReturnType<typeof setTimeout>[] = [];
-    STAGE_DURATIONS.forEach((dur, i) => {
-      elapsed += dur;
-      timers.push(
-        setTimeout(() => setStage((i + 1) as AnalysisStage), elapsed),
-      );
-    });
-    timers.push(setTimeout(() => setAnimDone(true), elapsed + 1200));
-    return () => timers.forEach(clearTimeout);
-  }, []);
+    onCompleteRef.current = onComplete;
+  }, [onComplete]);
 
-  /* API call — starts immediately in parallel with animation */
   useEffect(() => {
-    fetchReport(file)
+    fetchReportWithProgress(postUrl, (progress) => {
+      const { stage: serverStage, message, progress: pct } = progress;
+
+      setStageLabel(serverStage === "starting" ? "Dispatched" : serverStage);
+      setStageDetail(message);
+
+      if (pct < 0.33) setStage(1);
+      else if (pct < 0.66) setStage(2);
+      else if (pct < 1) setStage(3);
+      else setStage(4);
+    })
       .then((report) => {
         pendingReport.current = report;
-        // If animation already finished, fire immediately
-        if (animDone) onCompleteRef.current(report);
+        if (!hasCompletedRef.current) {
+          hasCompletedRef.current = true;
+          setTimeout(() => onCompleteRef.current(report), 800);
+        }
       })
       .catch((err) => {
+        setError(err instanceof Error ? err.message : "Analysis failed");
         console.error("Analysis failed:", err);
-        // Still resolve with null so the user isn't stuck — page handles the error
-        if (animDone) onCompleteRef.current(null as unknown as PostcardReport);
       });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [file]);
+  }, [postUrl]);
 
-  /* When animation finishes, fire if report is already back */
-  useEffect(() => {
-    if (animDone && pendingReport.current) {
-      onCompleteRef.current(pendingReport.current);
-    }
-  }, [animDone]);
-
-  // Airplane x position across the 1200-wide SVG viewBox
   const planeX =
     stage === 0
       ? -60
@@ -332,7 +320,6 @@ export function AnalysisJourney({
         )`,
       }}
     >
-      {/* Landscape SVG */}
       <div className="absolute inset-x-0" style={{ top: "15%" }}>
         <svg
           viewBox="0 0 1200 320"
@@ -340,26 +327,22 @@ export function AnalysisJourney({
           preserveAspectRatio="xMidYMax meet"
           aria-hidden
         >
-          {/* Clouds */}
           <Cloud cx={100} cy={40} scale={1.1} delay={0} />
           <Cloud cx={450} cy={20} scale={0.8} delay={3} />
           <Cloud cx={800} cy={50} scale={1.0} delay={6} />
           <Cloud cx={1050} cy={25} scale={0.7} delay={2} />
           <Cloud cx={280} cy={70} scale={0.55} delay={9} />
 
-          {/* Far hills */}
           <path
             d="M0,200 C200,140 400,175 600,155 C800,130 1000,168 1200,150 L1200,320 L0,320 Z"
             fill="var(--postal-green-far)"
             opacity="0.65"
           />
-          {/* Mid hills */}
           <path
             d="M0,235 C150,195 350,220 550,208 C750,194 950,224 1200,212 L1200,320 L0,320 Z"
             fill="var(--postal-green-mid)"
             opacity="0.75"
           />
-          {/* Winding path / road */}
           <path
             d="M0,278 Q300,265 500,272 Q700,278 900,268 Q1050,260 1200,270"
             fill="none"
@@ -367,13 +350,11 @@ export function AnalysisJourney({
             strokeWidth="5"
             opacity="0.5"
           />
-          {/* Near hill */}
           <path
             d="M0,280 C100,265 300,275 500,270 C700,264 900,278 1200,272 L1200,320 L0,320 Z"
             fill="var(--postal-green-near)"
           />
 
-          {/* Mailboxes */}
           {STAGES.map((s, i) => (
             <g
               key={i}
@@ -389,7 +370,6 @@ export function AnalysisJourney({
         </svg>
       </div>
 
-      {/* Paper airplane */}
       <motion.div
         className="absolute pointer-events-none"
         style={{ top: "18%" }}
@@ -412,12 +392,57 @@ export function AnalysisJourney({
         </div>
       </motion.div>
 
-      {/* Stage label */}
       <div className="absolute top-6 left-1/2 -translate-x-1/2 text-center">
         <AnimatePresence mode="wait">
-          {stage < 4 && (
+          {error && (
             <motion.div
-              key={stage}
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              transition={{ duration: 0.5 }}
+              className="flex flex-col items-center gap-6 px-4"
+              style={{
+                background: "rgba(253,246,227,0.85)",
+                backdropFilter: "blur(6px)",
+              }}
+            >
+              <p
+                className="text-lg font-bold"
+                style={{
+                  fontFamily: "var(--font-serif)",
+                  color: "var(--postal-red)",
+                }}
+              >
+                Something went wrong
+              </p>
+              <p
+                className="text-sm"
+                style={{
+                  fontFamily: "var(--font-serif)",
+                  color: "var(--postal-ink-muted)",
+                }}
+              >
+                {error}
+              </p>
+              <button
+                className="text-xs tracking-widest uppercase px-6 py-2"
+                style={{
+                  fontFamily: "var(--font-serif)",
+                  color: "var(--postal-ink-muted)",
+                  border: "1px solid var(--postal-ink-faint)",
+                  background: "var(--postal-paper)",
+                  borderRadius: "2px",
+                  cursor: "pointer",
+                }}
+                onClick={() => window.location.reload()}
+              >
+                Try Again
+              </button>
+            </motion.div>
+          )}
+
+          {!error && (
+            <motion.div
+              key={stageLabel}
               initial={{ opacity: 0, y: -10 }}
               animate={{ opacity: 1, y: 0 }}
               exit={{ opacity: 0, y: 10 }}
@@ -436,7 +461,7 @@ export function AnalysisJourney({
                   color: "var(--postal-ink-muted)",
                 }}
               >
-                {stage === 0 ? "Dispatched" : STAGES[stage - 1]?.label}
+                {stageLabel}
               </p>
               <p
                 className="text-sm italic"
@@ -445,63 +470,12 @@ export function AnalysisJourney({
                   color: "var(--postal-ink)",
                 }}
               >
-                {stage === 0 ? "Evidence en route…" : STAGES[stage - 1]?.detail}
-              </p>
-            </motion.div>
-          )}
-
-          {/* Waiting for API after animation completes */}
-          {stage >= 4 && !animDone && (
-            <motion.div
-              key="waiting"
-              initial={{ opacity: 0, y: -10 }}
-              animate={{ opacity: 1, y: 0 }}
-              transition={{ duration: 0.4 }}
-              className="px-5 py-3 rounded-[2px] text-center"
-              style={{
-                background: "rgba(253,246,227,0.9)",
-                border: "1px solid var(--postal-ink-faint)",
-                backdropFilter: "blur(4px)",
-              }}
-            >
-              <p
-                className="text-xs tracking-[0.2em] uppercase mb-0.5"
-                style={{
-                  fontFamily: "var(--font-serif)",
-                  color: "var(--postal-ink-muted)",
-                }}
-              >
-                Finalising
-              </p>
-              <p
-                className="text-sm italic"
-                style={{
-                  fontFamily: "var(--font-serif)",
-                  color: "var(--postal-ink)",
-                }}
-              >
-                Your postcard is arriving…
+                {stageDetail}
               </p>
             </motion.div>
           )}
         </AnimatePresence>
       </div>
-
-      {/* Preview thumbnail — bottom-right */}
-      <motion.div
-        className="absolute bottom-6 right-6"
-        initial={{ opacity: 0 }}
-        animate={{ opacity: 1 }}
-        transition={{ delay: 0.5 }}
-      >
-        {/* eslint-disable-next-line @next/next/no-img-element */}
-        <img
-          src={imageUrl}
-          alt="Evidence preview"
-          className="w-16 h-16 object-cover opacity-60"
-          style={{ border: "1px solid var(--postal-ink-faint)" }}
-        />
-      </motion.div>
     </div>
   );
 }

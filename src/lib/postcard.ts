@@ -1,9 +1,18 @@
 import { z } from "zod";
+import { db } from "@/db";
+import { analyses, posts } from "@/db/schema";
+import { eq, sql } from "drizzle-orm";
 import { preprocessImage } from "./vision/processor";
-import { extractPostmark } from "./vision/ocr";
+import { extractPostcard } from "./vision/ocr";
 import { navigateToSource } from "./agents/navigator";
-import { auditPostmark } from "./agents/verifier";
-import { corroboratePostmark } from "./agents/corroborator";
+import { auditPostcard } from "./agents/verifier";
+import { corroboratePostcard } from "./agents/corroborator";
+
+export type ProgressCallback = (
+  stage: string,
+  message: string,
+  progress: number,
+) => void;
 
 export const CorroborationSchema = z.object({
   primarySources: z.array(
@@ -35,25 +44,29 @@ export const CorroborationSchema = z.object({
 
 export type Corroboration = z.infer<typeof CorroborationSchema>;
 
+export const PostcardDataSchema = z.object({
+  username: z.string().optional(),
+  timestampText: z.string().optional(),
+  platform: z.string(),
+  engagement: z.record(z.string(), z.string()).optional(),
+  mainText: z.string(),
+  uiAnchors: z
+    .array(
+      z.object({
+        element: z.string(),
+        position: z.string(),
+        confidence: z.number(),
+      }),
+    )
+    .optional(),
+});
+
+export type PostcardData = z.infer<typeof PostcardDataSchema>;
+
 export const PostcardReportSchema = z.object({
   ocr: z.object({
     markdown: z.string(),
-    postmark: z.object({
-      username: z.string().optional(),
-      timestampText: z.string().optional(),
-      platform: z.string(),
-      engagement: z.record(z.string(), z.string()).optional(),
-      mainText: z.string(),
-      uiAnchors: z
-        .array(
-          z.object({
-            element: z.string(),
-            position: z.string(),
-            confidence: z.number(),
-          }),
-        )
-        .optional(),
-    }),
+    postmark: PostcardDataSchema,
   }),
   triangulation: z.object({
     targetUrl: z.string().url().optional(),
@@ -72,50 +85,35 @@ export const PostcardReportSchema = z.object({
 
 export type PostcardReport = z.infer<typeof PostcardReportSchema>;
 
-// ---------------------------------------------------------------------------
-// Mock report — returned immediately when NEXT_PUBLIC_MOCK_PIPELINE=true.
-// Lets you exercise the full UI flow (animations, Travel Log, Postmark Score)
-// without spending any API quota.
-// ---------------------------------------------------------------------------
-const MOCK_REPORT: PostcardReport = {
-  ocr: {
-    markdown:
-      "## @YeOldeTweeter\n**Breaking: local man discovers that water is, in fact, wet.**\n*14h ago · 3.2K Retweets · 21.4K Likes*",
-    postmark: {
-      username: "@YeOldeTweeter",
-      timestampText: "14h ago",
-      platform: "X",
-      engagement: { likes: "21.4K", retweets: "3.2K", views: "812K" },
-      mainText: "Breaking: local man discovers that water is, in fact, wet.",
-      uiAnchors: [
-        {
-          element: "verified-badge",
-          position: "next-to-username",
-          confidence: 0.97,
-        },
-        { element: "x-logo", position: "top-left", confidence: 0.99 },
-      ],
-    },
-  },
-  triangulation: {
-    targetUrl: "https://x.com/YeOldeTweeter/status/1800000000000000001",
-    queries: [
-      'site:x.com @YeOldeTweeter "water is wet" 14h ago',
-      'YeOldeTweeter "local man discovers" tweet X',
-    ],
-  },
-  audit: {
-    originScore: 1,
-    temporalScore: 0.9,
-    visualScore: 0.9,
-    totalScore: 0.94,
-    auditLog: [
-      "[MOCK] Starting audit for URL: https://x.com/YeOldeTweeter/status/1800000000000000001",
-      "[MOCK] URL verified: Direct match found.",
-      "[MOCK] Temporal match: Timestamp consistent with live page content.",
-      "[MOCK] Visual consistency: UI fingerprints align with X platform template.",
-    ],
-  },
+export const PostcardRequestSchema = z
+  .object({
+    url: z.string().url().optional(),
+    image: z.string().optional(), // base64 encoded image
+    userApiKey: z.string().optional(),
+  })
+  .refine((data) => data.url || data.image, {
+    message: "Either url or image must be provided",
+  });
+
+export type PostcardRequest = z.infer<typeof PostcardRequestSchema>;
+
+export const PostcardResponseSchema = z.object({
+  url: z.string().url(),
+  markdown: z.string(),
+  platform: z.string(),
+  corroboration: CorroborationSchema,
+  postcardScore: z.number().min(0).max(1),
+  timestamp: z.string().datetime(),
+  forensicReport: PostcardReportSchema.optional(), // Include full report if requested
+});
+
+export type PostcardResponse = z.infer<typeof PostcardResponseSchema>;
+
+const MOCK_POSTCARD_RESPONSE: PostcardResponse = {
+  url: "https://x.com/example/status/123",
+  markdown:
+    "## @YeOldeTweeter\n**Breaking: local man discovers that water is, in fact, wet.**\n*14h ago · 3.2K Retweets · 21.4K Likes*",
+  platform: "X",
   corroboration: {
     primarySources: [
       {
@@ -150,45 +148,71 @@ const MOCK_REPORT: PostcardReport = {
       "[MOCK] Corroboration complete: 2 sources found, 2 from trusted domains",
     ],
   },
+  postcardScore: 0.85,
   timestamp: new Date().toISOString(),
 };
 
-export type ProgressCallback = (
-  stage: string,
-  message: string,
-  progress: number,
-) => void;
-
-export const TraceReportSchema = z.object({
-  url: z.string().url(),
-  markdown: z.string(),
-  platform: z.string(),
-  corroboration: CorroborationSchema,
-  postmarkScore: z.number().min(0).max(1),
-  timestamp: z.string().datetime(),
-});
-
-export type TraceReport = z.infer<typeof TraceReportSchema>;
-
-export async function processTrace(
+export async function processPostcardFromUrl(
   url: string,
   userApiKey?: string,
   onProgress?: ProgressCallback,
-): Promise<TraceReport> {
+): Promise<PostcardResponse> {
   const progress = (stage: string, message: string, p: number) => {
     onProgress?.(stage, message, p);
   };
 
-  if (process.env.NEXT_PUBLIC_MOCK_PIPELINE === "true") {
-    progress("complete", "Mock trace complete", 1);
-    return {
-      url: "https://x.com/example/status/123",
-      markdown: MOCK_REPORT.ocr.markdown,
-      platform: "X",
-      corroboration: MOCK_REPORT.corroboration,
-      postmarkScore: 0.85,
-      timestamp: new Date().toISOString(),
-    };
+  if (process.env.NEXT_PUBLIC_FAKE_PIPELINE === "true") {
+    progress("complete", "Mock postcard complete", 1);
+    return { ...MOCK_POSTCARD_RESPONSE };
+  }
+
+  try {
+    const cachedAnalysis = await db
+      .select()
+      .from(analyses)
+      .innerJoin(posts, eq(posts.url, url))
+      .orderBy(sql`${analyses.hits} DESC`)
+      .limit(1);
+
+    if (cachedAnalysis.length > 0) {
+      await db
+        .update(analyses)
+        .set({ hits: sql`hits + 1` })
+        .where(eq(analyses.id, cachedAnalysis[0].analyses.id));
+
+      const primarySources = JSON.parse(
+        cachedAnalysis[0].analyses.primarySources || "[]",
+      );
+      const queriesExecuted = JSON.parse(
+        cachedAnalysis[0].analyses.queriesExecuted || "[]",
+      );
+      const corroborationLog = JSON.parse(
+        cachedAnalysis[0].analyses.corroborationLog || "[]",
+      );
+
+      progress("complete", "Cache hit - returning cached analysis", 1);
+      return {
+        url: cachedAnalysis[0].posts.url,
+        markdown: cachedAnalysis[0].posts.markdown || "",
+        platform: cachedAnalysis[0].posts.platform || "Other",
+        corroboration: {
+          primarySources,
+          queriesExecuted,
+          verdict: (cachedAnalysis[0].analyses.verdict || "inconclusive") as
+            | "verified"
+            | "disputed"
+            | "inconclusive"
+            | "insufficient_data",
+          summary: cachedAnalysis[0].analyses.summary || "",
+          confidenceScore: cachedAnalysis[0].analyses.confidenceScore || 0,
+          corroborationLog,
+        },
+        postcardScore: cachedAnalysis[0].analyses.postcardScore,
+        timestamp: cachedAnalysis[0].analyses.createdAt.toISOString(),
+      };
+    }
+  } catch (cacheError) {
+    console.error("Cache lookup error:", cacheError);
   }
 
   progress("scraping", "Fetching content via Jina Reader...", 0.1);
@@ -204,34 +228,84 @@ export async function processTrace(
   const platform = inferPlatform(url);
   progress("corroborating", "Searching for primary sources...", 0.4);
 
-  const postmark: import("./vision/ocr").Postmark = {
+  const postcard: import("./vision/ocr").Postcard = {
     platform: platform as "X" | "YouTube" | "Reddit" | "Instagram" | "Other",
     username: undefined,
     timestampText: undefined,
     mainText: markdown.slice(0, 500),
   };
 
-  const corroboration = await corroboratePostmark(postmark, markdown, (msg) => {
-    progress("corroborating", msg, 0.5);
-  });
+  const corroboration = await corroboratePostcard(
+    postcard,
+    markdown,
+    (msg: string) => {
+      progress("corroborating", msg, 0.5);
+    },
+  );
 
-  progress("scoring", "Calculating Postmark score...", 0.9);
+  progress("scoring", "Calculating Postcard score...", 0.9);
 
-  const postmarkScore =
+  const postcardScore =
     0.7 * corroboration.confidenceScore +
     (0.3 *
-      corroboration.primarySources.filter((s) => s.relevance === "supporting")
-        .length) /
+      corroboration.primarySources.filter(
+        (s: { relevance: string }) => s.relevance === "supporting",
+      ).length) /
       Math.max(corroboration.primarySources.length, 1);
 
-  progress("complete", "Trace complete", 1);
+  try {
+    const existingPost = await db
+      .select()
+      .from(posts)
+      .where(eq(posts.url, url))
+      .limit(1);
 
-  return TraceReportSchema.parse({
+    if (existingPost.length > 0) {
+      await db
+        .update(analyses)
+        .set({ hits: sql`hits + 1` })
+        .where(eq(analyses.postId, existingPost[0].id));
+    } else {
+      const postId = crypto.randomUUID();
+      await db.insert(posts).values({
+        id: postId,
+        url,
+        platform,
+        markdown,
+        mainText: markdown.slice(0, 500),
+      });
+
+      await db.insert(analyses).values({
+        id: crypto.randomUUID(),
+        postId,
+        url,
+        platform,
+        postcardScore,
+        originScore: 0.5,
+        corroborationScore: corroboration.confidenceScore,
+        biasScore: 0.5,
+        temporalScore: 0.5,
+        verdict: corroboration.verdict,
+        summary: corroboration.summary,
+        confidenceScore: corroboration.confidenceScore,
+        primarySources: JSON.stringify(corroboration.primarySources),
+        queriesExecuted: JSON.stringify(corroboration.queriesExecuted),
+        corroborationLog: JSON.stringify(corroboration.corroborationLog),
+        status: "completed",
+      });
+    }
+  } catch (dbError) {
+    console.error("Database error:", dbError);
+  }
+
+  progress("complete", "Postcard complete", 1);
+
+  return PostcardResponseSchema.parse({
     url,
     markdown,
     platform,
     corroboration,
-    postmarkScore,
+    postcardScore,
     timestamp: new Date().toISOString(),
   });
 }
@@ -246,37 +320,64 @@ function inferPlatform(url: string): string {
   return "Other";
 }
 
-export async function processPostcard(
+export async function processPostcardFromImage(
   imageBuffer: Buffer,
   mimeType: string = "image/png",
 ): Promise<PostcardReport> {
-  // Short-circuit with mock data when quota is exhausted or during UI testing.
-  if (process.env.NEXT_PUBLIC_MOCK_PIPELINE === "true") {
-    return { ...MOCK_REPORT, timestamp: new Date().toISOString() };
+  if (process.env.NEXT_PUBLIC_FAKE_PIPELINE === "true") {
+    return {
+      ocr: {
+        markdown:
+          "## @YeOldeTweeter\n**Breaking: local man discovers that water is, in fact, wet.**\n*14h ago · 3.2K Retweets · 21.4K Likes*",
+        postmark: {
+          username: "@YeOldeTweeter",
+          timestampText: "14h ago",
+          platform: "X",
+          engagement: { likes: "21.4K", retweets: "3.2K", views: "812K" },
+          mainText:
+            "Breaking: local man discovers that water is, in fact, wet.",
+        },
+      },
+      triangulation: {
+        targetUrl: "https://x.com/YeOldeTweeter/status/1800000000000000001",
+        queries: [
+          'site:x.com @YeOldeTweeter "water is wet" 14h ago',
+          'YeOldeTweeter "local man discovers" tweet X',
+        ],
+      },
+      audit: {
+        originScore: 1,
+        temporalScore: 0.9,
+        visualScore: 0.9,
+        totalScore: 0.94,
+        auditLog: [
+          "[MOCK] Starting audit for URL: https://x.com/YeOldeTweeter/status/1800000000000000001",
+          "[MOCK] URL verified: Direct match found.",
+          "[MOCK] Temporal match: Timestamp consistent with live page content.",
+          "[MOCK] Visual consistency: UI fingerprints align with X platform template.",
+        ],
+      },
+      corroboration: MOCK_POSTCARD_RESPONSE.corroboration,
+      timestamp: new Date().toISOString(),
+    };
   }
 
-  // 1. Preprocess — resize to ≤1024px, normalize contrast + sharpness for OCR accuracy
   const processed = await preprocessImage(imageBuffer, {
     contrast: 1.2,
     sharpen: true,
   });
 
-  // 2. OCR + Postmark extraction via Gemini 1.5 Flash vision
-  const ocr = await extractPostmark(processed, mimeType);
+  const ocr = await extractPostcard(processed, mimeType);
 
-  // 3. Throttle — avoid hitting the RPM cap between back-to-back Gemini calls
   await new Promise((resolve) => setTimeout(resolve, 2000));
 
-  // 4. Navigator Agent — triangulate the source URL via Google Search grounding
   const { url: targetUrl, queries } = await navigateToSource(
-    ocr.postmark,
+    ocr.postcard,
     ocr.markdown,
   );
 
-  // 5. Forensic Audit — Playwright scrapes the live page and computes scores
-  //    Skip if no URL was found by the navigator
   const audit = targetUrl
-    ? await auditPostmark(targetUrl, ocr.postmark)
+    ? await auditPostcard(targetUrl, ocr.postcard)
     : {
         originScore: 0,
         temporalScore: 0,
@@ -285,12 +386,13 @@ export async function processPostcard(
         auditLog: ["Skipping audit: No target URL identified by navigator."],
       };
 
-  // 6. Primary Source Corroboration — AI SDK agent loop with Google Dorking
-  //    Uses trusted domain allowlist to find corroborating or refuting sources
-  const corroboration = await corroboratePostmark(ocr.postmark, ocr.markdown);
+  const corroboration = await corroboratePostcard(ocr.postcard, ocr.markdown);
 
   return PostcardReportSchema.parse({
-    ocr,
+    ocr: {
+      markdown: ocr.markdown,
+      postmark: ocr.postcard,
+    },
     triangulation: { targetUrl, queries },
     audit,
     corroboration,

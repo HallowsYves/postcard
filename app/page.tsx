@@ -11,14 +11,11 @@ type PageStage = "upload" | "analyzing" | "results";
 
 export default function PostcardHome() {
   const [pageStage, setPageStage] = useState<PageStage>("upload");
-  const [evidenceFile, setEvidenceFile] = useState<File | null>(null);
-  const [evidenceUrl, setEvidenceUrl] = useState<string | null>(null);
+  const [postUrl, setPostUrl] = useState<string | null>(null);
   const [report, setReport] = useState<PostcardReport | null>(null);
 
-  const handleFileSubmitted = useCallback((file: File) => {
-    const url = URL.createObjectURL(file);
-    setEvidenceFile(file);
-    setEvidenceUrl(url);
+  const handleUrlSubmitted = useCallback((url: string) => {
+    setPostUrl(url);
     setPageStage("analyzing");
   }, []);
 
@@ -27,14 +24,8 @@ export default function PostcardHome() {
     setPageStage("results");
   }, []);
 
-  if (pageStage === "analyzing" && evidenceFile && evidenceUrl) {
-    return (
-      <AnalysisJourney
-        imageUrl={evidenceUrl}
-        file={evidenceFile}
-        onComplete={handleReportReady}
-      />
-    );
+  if (pageStage === "analyzing" && postUrl) {
+    return <AnalysisJourney postUrl={postUrl} onComplete={handleReportReady} />;
   }
 
   if (pageStage === "results" && report) {
@@ -44,7 +35,7 @@ export default function PostcardHome() {
   return (
     <main>
       <Hero />
-      <DropZone onFileSubmitted={handleFileSubmitted} />
+      <DropZone onUrlSubmitted={handleUrlSubmitted} />
     </main>
   );
 }

@@ -1,14 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
-import { z } from "zod";
-import { processTrace } from "@/lib/postcard";
+import {
+  processPostcardFromUrl,
+  processPostcardFromImage,
+  PostcardRequestSchema,
+} from "@/src/lib/postcard";
 
 export const runtime = "nodejs";
-export const maxDuration = 60;
-
-const RequestSchema = z.object({
-  url: z.string().url(),
-  userApiKey: z.string().optional(),
-});
+export const maxDuration = 120;
 
 export async function POST(request: NextRequest): Promise<NextResponse> {
   const traceId = crypto.randomUUID();
@@ -20,7 +18,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     return NextResponse.json({ error: "Invalid JSON body." }, { status: 400 });
   }
 
-  const parsed = RequestSchema.safeParse(body);
+  const parsed = PostcardRequestSchema.safeParse(body);
   if (!parsed.success) {
     return NextResponse.json(
       { error: "Invalid request.", details: parsed.error.flatten() },
@@ -28,7 +26,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     );
   }
 
-  const { url, userApiKey } = parsed.data;
+  const { url, image, userApiKey } = parsed.data;
 
   const stream = new ReadableStream({
     async start(controller) {
@@ -43,20 +41,66 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       try {
         send("progress", {
           stage: "starting",
-          message: "Initializing trace...",
+          message: image
+            ? "Initializing forensic pipeline..."
+            : "Initializing trace...",
           progress: 0,
           traceId,
         });
 
-        const report = await processTrace(
-          url,
-          userApiKey,
-          (stage, message, progress) => {
-            send("progress", { stage, message, progress });
-          },
-        );
+        let report;
+        let forensicReport;
 
-        send("complete", { trace: report });
+        if (image) {
+          // Image-based analysis
+          const buffer = Buffer.from(image, "base64");
+          forensicReport = await processPostcardFromImage(buffer, "image/png");
+          report = {
+            url: forensicReport.triangulation.targetUrl || "",
+            markdown: forensicReport.ocr.markdown,
+            platform: forensicReport.ocr.postmark.platform,
+            corroboration: forensicReport.corroboration,
+            postcardScore: forensicReport.audit.totalScore,
+            timestamp: forensicReport.timestamp,
+          };
+        } else {
+          // URL-based analysis
+          report = await processPostcardFromUrl(
+            url!,
+            userApiKey,
+            (stage, message, progress) => {
+              send("progress", { stage, message, progress });
+            },
+          );
+          // Build forensic report from URL-based response
+          forensicReport = {
+            ocr: {
+              markdown: report.markdown,
+              postmark: {
+                platform: report.platform,
+                mainText: report.markdown.slice(0, 500),
+              },
+            },
+            triangulation: {
+              targetUrl: report.url,
+              queries: [],
+            },
+            audit: {
+              originScore: 0.5,
+              temporalScore: 0.5,
+              visualScore: 0,
+              totalScore: report.postcardScore,
+              auditLog: ["URL-based analysis - direct source verification"],
+            },
+            corroboration: report.corroboration,
+            timestamp: report.timestamp,
+          };
+        }
+
+        send("complete", {
+          postcard: report,
+          forensicReport,
+        });
       } catch (error) {
         send("error", {
           error: error instanceof Error ? error.message : "Trace failed",
